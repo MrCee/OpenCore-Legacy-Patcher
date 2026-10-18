@@ -132,10 +132,17 @@ class BuildSMBIOS:
             # Thus resulting in an infinite loop as Lilu tries to request the Board ID
             # To resolve this, set PlatformInfo -> DataHub -> BoardProduct and enable UpdateDataHub
 
-            # Note 1: Only apply if system is UEFI 1.2, this is generally Ivy Bridge and older
+            # Note 1: The UEFI 1.2 workaround applies to Ivy Bridge and older; the reported Haswell case is handled separately.
             # Note 2: Flipping 'UEFI -> ProtocolOverrides -> DataHub' will break hibernation
             if (smbios_data.smbios_dictionary[self.model]["CPU Generation"] <= cpu_data.CPUGen.ivy_bridge.value and self.model):
                 logging.info("- Detected UEFI 1.2 or older Mac, updating BoardProduct")
+                self.config["PlatformInfo"]["DataHub"]["BoardProduct"] = self.spoofed_board
+                self.config["PlatformInfo"]["UpdateDataHub"] = True
+
+            elif self.model == "MacBookPro11,3":
+                # Explicit model information also avoids the Lilu retry loop reported on Tahoe with this Haswell model.
+                logging.info("- Updating MacBookPro11,3 DataHub model information")
+                self.config["PlatformInfo"]["DataHub"]["SystemProductName"] = self.spoofed_model
                 self.config["PlatformInfo"]["DataHub"]["BoardProduct"] = self.spoofed_board
                 self.config["PlatformInfo"]["UpdateDataHub"] = True
 
