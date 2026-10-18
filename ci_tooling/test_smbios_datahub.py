@@ -20,7 +20,8 @@ ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = "_oclp_smbios_datahub_test"
 
 # Import the builder under an isolated namespace: the application package's
-# __init__ loads the GUI. Only hardware access and type-only constants are mocked.
+# __init__ loads the GUI. Hardware access, firmware conversion and type-only
+# constants are mocked; identity lookup and config generation use real code/data.
 for name in ("", ".datasets", ".detections", ".support", ".efi_builder"):
     module = types.ModuleType(PACKAGE + name)
     module.__path__ = [str(ROOT / "opencore_legacy_patcher" / name.lstrip(".").replace(".", "/"))]
@@ -66,6 +67,42 @@ def build_smbios(model, serial_settings="None", override="Default", host="iMac14
 
 
 class DataHubTests(unittest.TestCase):
+    def test_all_supported_targets_have_a_board_id_in_the_bundled_database(self):
+        for model in smbios.model_array.SupportedSMBIOS:
+            with self.subTest(model=model):
+                entry = smbios.smbios_data.smbios_dictionary[model]
+                self.assertIsInstance(entry["Board ID"], str)
+                self.assertTrue(entry["Board ID"])
+
+    def test_all_supported_targets_preserve_spoofing_mode_identity_rules(self):
+        for model in smbios.model_array.SupportedSMBIOS:
+            for mode in ("None", "Minimal", "Moderate", "Advanced"):
+                with self.subTest(model=model, mode=mode):
+                    config = build_smbios(model, mode)
+                    platform = config["PlatformInfo"]
+                    datahub = platform["DataHub"]
+                    entry = smbios.smbios_data.smbios_dictionary[model]
+                    automatic = mode in ("Moderate", "Advanced")
+                    self.assertEqual(platform["Automatic"], automatic)
+                    self.assertEqual(config["UEFI"]["ProtocolOverrides"]["DataHub"], automatic)
+                    if automatic:
+                        spoof = smbios.generate_smbios.set_smbios_model_spoof(model)
+                        self.assertEqual(platform["Generic"]["SystemProductName"], spoof)
+                        self.assertEqual(datahub["SystemProductName"], "")
+                        self.assertEqual(datahub["BoardProduct"], "")
+                        self.assertTrue(platform["UpdateDataHub"])
+                    elif mode == "Minimal":
+                        spoof = smbios.generate_smbios.set_smbios_model_spoof(model)
+                        self.assertEqual(datahub["SystemProductName"], model)
+                        self.assertEqual(datahub["BoardProduct"], smbios.smbios_data.smbios_dictionary[spoof]["Board ID"])
+                        self.assertTrue(platform["UpdateDataHub"])
+                    else:
+                        older = entry["CPU Generation"] <= smbios.cpu_data.CPUGen.ivy_bridge.value
+                        affected = model == "MacBookPro11,3"
+                        self.assertEqual(datahub["SystemProductName"], model if affected else "")
+                        self.assertEqual(datahub["BoardProduct"], entry["Board ID"] if older or affected else "")
+                        self.assertEqual(platform["UpdateDataHub"], older or affected)
+
     def test_mbp113_uses_target_identity_on_either_build_host(self):
         for host in ("MacBookPro11,3", "iMac14,2"):
             with self.subTest(host=host):
