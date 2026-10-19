@@ -8,6 +8,7 @@ import plistlib
 import tempfile
 import threading
 import subprocess
+import filecmp
 
 from pathlib import Path
 
@@ -44,6 +45,7 @@ class macOSInstallerFlashFrame(wx.Frame):
         self.available_installers_local: dict = {}
         self.available_disks: dict = {}
         self.prepare_result: bool = False
+        self.installer_assets_error: str = ""
 
         self.progress_bar_animation: gui_support.GaugePulseCallback = None
 
@@ -338,6 +340,10 @@ class macOSInstallerFlashFrame(wx.Frame):
             self.on_return_to_main_menu()
             return
 
+        if not self._retry_installer_assets(disk['identifier'], bytes_written_label, progress_bar_animation):
+            self.on_return_to_main_menu()
+            return
+
         progress_bar.SetValue(estimated_size)
 
         if gui_support.CheckProperties(self.constants).host_can_build() is False:
@@ -359,6 +365,30 @@ class macOSInstallerFlashFrame(wx.Frame):
             screen_location=self.GetPosition()
         )
         self.Destroy()
+
+
+    def _retry_installer_assets(self, disk, bytes_written_label, progress_bar_animation) -> bool:
+        # A valid Apple installer does not imply that OCLP's assets were copied.
+        # Retry only asset preparation; do not run createinstallmedia again.
+        while self.installer_assets_error:
+            answer = wx.MessageBox(
+                f"The macOS installer was created, but OCLP asset preparation did not complete.\n\n"
+                f"{self.installer_assets_error}\n\n"
+                "Automatic patcher installation may be unavailable. Check your network connection "
+                "and USB write access, then choose Yes to retry asset preparation without erasing "
+                "the installer. Choose No to return to the main menu.",
+                "OCLP installer assets incomplete", wx.YES_NO | wx.ICON_WARNING
+            )
+            if answer != wx.YES:
+                return False
+            bytes_written_label.SetLabel("Retrying OCLP Installer Assets...")
+            progress_bar_animation.start_pulse()
+            retry_thread = threading.Thread(target=self._prepare_installer_assets, args=(disk,))
+            retry_thread.start()
+            gui_support.wait_for_thread(retry_thread)
+            progress_bar_animation.stop_pulse()
+
+        return True
 
 
     def _prepare_resources(self, installer_path: str, disk: str) -> None:
@@ -394,6 +424,8 @@ class macOSInstallerFlashFrame(wx.Frame):
             logging.info("Failed to create macOS installer")
             popup = wx.MessageDialog(self, f"Failed to create macOS installer\n\nOutput: {output}\n\nError: {error}", "Error", wx.OK | wx.ICON_ERROR)
             popup.ShowModal()
+            gui_support.wait_for_thread(thread)
+            utilities.enable_sleep_after_running()
             return False
 
         logging.info("Successfully created macOS installer")
@@ -403,19 +435,43 @@ class macOSInstallerFlashFrame(wx.Frame):
         gui_support.wait_for_thread(thread)
 
         logging.info("Installing Root Patcher to drive")
-        self._install_installer_pkg(disk)
+        self._prepare_installer_assets(disk, download=False)
 
         utilities.enable_sleep_after_running()
         return True
 
 
     def _auto_package_handler(self):
+        """Record background download failures for the completion UI."""
+        self.installer_assets_error = ""
+        try:
+            self._download_installer_pkg()
+        except Exception as error:
+            self.installer_assets_error = f"{type(error).__name__}: {error}"
+            logging.exception("Failed to prepare AutoPkg-Assets.pkg")
+
+
+    def _prepare_installer_assets(self, disk: str, download: bool = True) -> None:
+        """Prepare assets independently of the destructive installer flash."""
+        try:
+            if download:
+                utilities.disable_sleep_while_running()
+                self._auto_package_handler()
+            self._install_installer_pkg(disk)
+        except Exception as error:
+            self.installer_assets_error = f"{type(error).__name__}: {error}"
+            logging.exception("Failed to copy OCLP installer assets")
+        finally:
+            if download:
+                utilities.enable_sleep_after_running()
+
+
+    def _download_installer_pkg(self):
         """
         Function's main goal is to grab the correct AutoPkg-Assets.pkg and unzip it
         Note the following:
             - When running a release build, pull from Github's release page with the same versioning
             - When running from source/unable to find on Github, use the nightly.link variant
-            - If nightly also fails, fall back to the manually uploaded variant
         """
         link = self.constants.installer_pkg_url
         if network_handler.NetworkUtilities(link).validate_link() is False:
@@ -430,38 +486,48 @@ class macOSInstallerFlashFrame(wx.Frame):
         autopkg_download = network_handler.DownloadObject(link, path)
         autopkg_download.download(spawn_thread=False)
 
-        if autopkg_download.download_complete is False:
-            logging.warning("Failed to download Install.pkg")
-            logging.warning(autopkg_download.error_msg)
-            return
+        if autopkg_download.download_complete is False or autopkg_download.error is True:
+            raise RuntimeError(f"Failed to download AutoPkg-Assets.pkg: {autopkg_download.error_msg}")
 
         # Download thread will re-enable Idle Sleep after downloading
         utilities.disable_sleep_while_running()
-        if not str(path).endswith(".zip"):
-            return
-        if Path(self.constants.installer_pkg_path).exists():
-            subprocess.run(["/bin/rm", self.constants.installer_pkg_path])
-        subprocess.run(["/usr/bin/ditto", "-V", "-x", "-k", "--sequesterRsrc", "--rsrc", self.constants.installer_pkg_zip_path, self.constants.payload_path])
+        if str(path).endswith(".zip"):
+            Path(self.constants.installer_pkg_path).unlink(missing_ok=True)
+            subprocess.run(["/usr/bin/ditto", "-V", "-x", "-k", "--sequesterRsrc", "--rsrc", self.constants.installer_pkg_zip_path, self.constants.payload_path], check=True)
+        pkg = Path(self.constants.installer_pkg_path)
+        if not pkg.is_file() or pkg.stat().st_size == 0:
+            raise RuntimeError("Downloaded assets did not contain a non-empty AutoPkg-Assets.pkg")
 
 
     def _install_installer_pkg(self, disk):
         disk = disk + "s2" # ESP sits at 1, and we know macOS will have created the main partition at 2
 
-        if not Path(self.constants.installer_pkg_path).exists():
-            return
-
         path = utilities.grab_mount_point_from_disk(disk)
         if not Path(path + "/System/Library/CoreServices/SystemVersion.plist").exists():
-            return
+            raise RuntimeError(f"Could not identify the macOS installer at {path}")
 
-        os_version = plistlib.load(Path(path + "/System/Library/CoreServices/SystemVersion.plist").open("rb"))
+        with Path(path + "/System/Library/CoreServices/SystemVersion.plist").open("rb") as stream:
+            os_version = plistlib.load(stream)
         kernel_version = os_data.os_conversion.os_to_kernel(os_version["ProductVersion"])
         if int(kernel_version) < os_data.os_data.big_sur:
             logging.info("Installer unsupported, requires Big Sur or newer")
+            self.installer_assets_error = ""
             return
 
-        subprocess.run(["/bin/mkdir", "-p", f"{path}/Library/Packages/"])
-        subprocess.run(generate_copy_arguments(self.constants.installer_pkg_path, f"{path}/Library/Packages/"))
+        # Do not reuse a cached/partial package after a failed download.
+        if self.installer_assets_error:
+            return
+
+        pkg = Path(self.constants.installer_pkg_path)
+        if not pkg.is_file() or pkg.stat().st_size == 0:
+            raise RuntimeError("AutoPkg-Assets.pkg is missing or empty")
+
+        packages = Path(path) / "Library/Packages"
+        packages.mkdir(parents=True, exist_ok=True)
+        subprocess.run(generate_copy_arguments(self.constants.installer_pkg_path, f"{packages}/"), check=True)
+        copied_pkg = packages / pkg.name
+        if not copied_pkg.is_file() or not filecmp.cmp(pkg, copied_pkg, shallow=False):
+            raise RuntimeError(f"AutoPkg-Assets.pkg copy verification failed at {copied_pkg}")
 
         # Chainload KDK and Metallib
         self._chainload_metallib(os_version["ProductBuildVersion"], os_version["ProductVersion"], Path(path + "/Library/Packages/"))

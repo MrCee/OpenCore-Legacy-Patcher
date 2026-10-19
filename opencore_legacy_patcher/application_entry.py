@@ -9,6 +9,7 @@ import logging
 import threading
 
 from pathlib import Path
+from urllib.parse import quote
 
 from . import constants
 
@@ -106,11 +107,7 @@ class OpenCoreLegacyPatcher:
 
         # Generate commit info
         self.constants.commit_info = commit_info.ParseCommitInfo(self.constants.launcher_binary).generate_commit_info()
-        if self.constants.commit_info[0] not in ["Running from source", "Built from source"]:
-            # Now that we have commit info, update nightly link
-            branch = self.constants.commit_info[0]
-            branch = branch.replace("refs/heads/", "")
-            self.constants.installer_pkg_url_nightly = self.constants.installer_pkg_url_nightly.replace("main", branch)
+        self._configure_installer_pkg_urls()
 
         # Generate defaults
         defaults.GenerateDefaults(self.computer.real_model, True, self.constants)
@@ -133,6 +130,17 @@ class OpenCoreLegacyPatcher:
                 time.sleep(self.constants.thread_sleep_interval)
 
         arguments.arguments(self.constants)
+
+
+    def _configure_installer_pkg_urls(self) -> None:
+        """Use the packaged release tag, including prerelease suffixes."""
+        ref = self.constants.commit_info[0]
+        if ref.startswith("refs/tags/"):
+            tag = quote(ref[len("refs/tags/"):], safe="")
+            self.constants.installer_pkg_url = f"{self.constants.repo_link}/releases/download/{tag}/AutoPkg-Assets.pkg"
+        elif ref not in ["Running from source", "Built from source"]:
+            branch = ref.removeprefix("refs/heads/")
+            self.constants.installer_pkg_url_nightly = self.constants.installer_pkg_url_nightly.replace("/main/", f"/{branch}/")
 
 def main():
     """
